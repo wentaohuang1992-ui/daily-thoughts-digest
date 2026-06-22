@@ -3,7 +3,7 @@
  * 功能：
  * - Telegram Bot 接收文字观点、语音消息
  * - 实时聊天（? 前缀提问）
- * - 讯飞语音识别
+ * - 本地 Whisper 语音识别（免费）
  * - Redis 存储
  * - DeepSeek 每日AI归纳
  * - Railway 部署
@@ -17,6 +17,8 @@ const cron = require('node-cron');
 const dotenv = require('dotenv');
 const fs = require('fs');
 const path = require('path');
+const { exec } = require('child_process');
+const { promisify } = require('util');
 
 dotenv.config();
 
@@ -31,13 +33,9 @@ const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/chat/completions';
 const REDIS_URL = process.env.REDIS_URL;
 const PORT = process.env.PORT || 3000;
 
-// 讯飞配置
-const XFYUN_APPID = process.env.XFYUN_APPID;
-const XFYUN_API_KEY = process.env.XFYUN_API_KEY;
-const XFYUN_API_SECRET = process.env.XFYUN_API_SECRET;
-
 const bot = new TelegramBot(BOT_TOKEN);
 const redisClient = redis.createClient({ url: REDIS_URL });
+const execPromise = promisify(exec);
 
 // ============ Redis 初始化 ============
 redisClient.on('error', err => console.error('Redis error:', err));
@@ -117,64 +115,65 @@ async function callDeepSeek(prompt) {
   }
 }
 
-// ============ 讯飞语音识别 ============
+// ============ Whisper 语音识别 ============
 
-async function recognizeVoice(audioBuffer) {
+async function recognizeVoiceWithWhisper(audioFilePath) {
   try {
-    if (!XFYUN_APPID || !XFYUN_API_KEY) {
-      throw new Error('讯飞配置缺失');
-    }
-
-    // 使用讯飞的 HTTP API
-    const timestamp = Math.floor(Date.now() / 1000);
-    const crypto = require('crypto');
+    console.log(`🎙️ 使用 Whisper 识别语音: ${audioFilePath}`);
     
-    // 生成签名
-    const signStr = `${XFYUN_APPID}${timestamp}`;
-    const md5 = crypto.createHash('md5').update(signStr + XFYUN_API_SECRET).digest('hex');
-    const checksum = md5;
-
-    // 发送到讯飞 API
-    const response = await axios.post(
-      'https://api.xfyun.cn/v1/service/v1/asr',
-      audioBuffer,
-      {
-        headers: {
-          'Content-Type': 'audio/wav',
-          'X-Appid': XFYUN_APPID,
-          'X-CurTime': timestamp,
-          'X-CheckSum': checksum,
-          'X-Real-Ip': '127.0.0.1',
-        },
-        timeout: 30000,
-      }
-    );
-
-    if (response.data.code === '0') {
-      const result = response.data.data?.result || [];
-      let text = '';
-      for (const item of result) {
-        if (item.rec_result) {
-          text += item.rec_result;
-        }
-      }
-      return text || '无法识别内容';
-    } else {
-      throw new Error(`讯飞返回错误: ${response.data.message}`);
+    // 使用 OpenAI 官方的 Whisper API（更可靠）
+    // 或者用本地 Whisper 命令行工具（如果已安装）
+    
+    // 方案 1：用 OpenAI 的 Whisper API（需要 API Key）
+    if (process.env.OPENAI_API_KEY) {
+      return await recognizeVoiceWithOpenAI(audioFilePath);
     }
+    
+    // 方案 2：用本地 Whisper 命令行工具
+    console.log('尝试使用本地 Whisper 命令行工具...');
+    const { stdout } = await execPromise(`whisper "${audioFilePath}" --language zh --output_format txt --output_dir /tmp --quiet`);
+    
+    // 读取输出文件
+    const txtFile = audioFilePath.replace(/\.[^/.]+$/, '.txt');
+    const text = fs.readFileSync(txtFile, 'utf-8').trim();
+    fs.unlinkSync(txtFile); // 删除临时文件
+    
+    return text || '无法识别内容';
   } catch (error) {
-    console.error('讯飞语音识别错误:', error.message);
+    console.error('Whisper 识别错误:', error.message);
     throw new Error(`语音识别失败: ${error.message}`);
   }
 }
 
-async function downloadFile(fileUrl) {
+async function recognizeVoiceWithOpenAI(audioFilePath) {
+  try {
+    const { OpenAI } = require('openai');
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    });
+
+    const audioFile = fs.createReadStream(audioFilePath);
+    const transcript = await openai.audio.transcriptions.create({
+      file: audioFile,
+      model: 'whisper-1',
+      language: 'zh',
+    });
+
+    return transcript.text || '无法识别内容';
+  } catch (error) {
+    console.error('OpenAI Whisper 错误:', error.message);
+    throw error;
+  }
+}
+
+async function downloadFile(fileUrl, filePath) {
   try {
     const response = await axios.get(fileUrl, { 
       responseType: 'arraybuffer',
       timeout: 30000 
     });
-    return response.data;
+    fs.writeFileSync(filePath, response.data);
+    return filePath;
   } catch (error) {
     console.error('文件下载错误:', error.message);
     throw error;
@@ -266,11 +265,27 @@ bot.on('message', async msg => {
         const filePath = file.file_path;
         const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
         
-        // 下载语音文件
-        const audioBuffer = await downloadFile(fileUrl);
+        // 下载语音文件到临时位置
+        const tempAudioPath = `/tmp/voice_${Date.now()}.ogg`;
+        await downloadFile(fileUrl, tempAudioPath);
         
         // 识别语音
-        const recognizedText = await recognizeVoice(audioBuffer);
+        let recognizedText;
+        try {
+          recognizedText = await recognizeVoiceWithWhisper(tempAudioPath);
+        } catch (error) {
+          // 如果本地 Whisper 失败，尝试用 OpenAI API
+          if (process.env.OPENAI_API_KEY) {
+            recognizedText = await recognizeVoiceWithOpenAI(tempAudioPath);
+          } else {
+            throw new Error('需要安装本地 Whisper 或设置 OPENAI_API_KEY');
+          }
+        }
+        
+        // 清理临时文件
+        try {
+          fs.unlinkSync(tempAudioPath);
+        } catch (e) {}
         
         // 提取标签（从消息的 caption 中）
         const caption = msg.caption || '';
@@ -328,7 +343,6 @@ bot.on('message', async msg => {
 <b>日常操作：</b>
 - 直接发送消息 = 保存观点
   例：#投资 光伏逆变器价格战...
-  （自动提取 #投资 标签）
 
 - 发送语音 = 语音转文字自动保存
   例：[录音语音] 可选加标签 #投资
@@ -420,7 +434,7 @@ const server = app.listen(PORT, () => {
   console.log(`📡 服务器运行在端口 ${PORT}`);
   console.log(`🤖 Telegram Bot ID: ${YOUR_CHAT_ID}`);
   console.log(`💾 Redis: ${REDIS_URL ? '已连接' : '未配置'}`);
-  console.log(`🎙️ 讯飞语音识别: ${XFYUN_APPID ? '已配置' : '未配置'}`);
+  console.log(`🎙️ 语音识别: Whisper（本地或 OpenAI）`);
   console.log(`🔄 每日总结时间: UTC 15:00 (北京时间 23:00)\n`);
 
   bot.startPolling();
