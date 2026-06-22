@@ -1,6 +1,9 @@
 /**
  * 每日观点自动归纳系统
- * - Telegram Bot 接收消息
+ * 功能：
+ * - Telegram Bot 接收文字观点、语音消息
+ * - 实时聊天（? 前缀提问）
+ * - 讯飞语音识别
  * - Redis 存储
  * - DeepSeek 每日AI归纳
  * - Railway 部署
@@ -12,6 +15,8 @@ const redis = require('redis');
 const axios = require('axios');
 const cron = require('node-cron');
 const dotenv = require('dotenv');
+const fs = require('fs');
+const path = require('path');
 
 dotenv.config();
 
@@ -25,6 +30,11 @@ const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/chat/completions';
 const REDIS_URL = process.env.REDIS_URL;
 const PORT = process.env.PORT || 3000;
+
+// 讯飞配置
+const XFYUN_APPID = process.env.XFYUN_APPID;
+const XFYUN_API_KEY = process.env.XFYUN_API_KEY;
+const XFYUN_API_SECRET = process.env.XFYUN_API_SECRET;
 
 const bot = new TelegramBot(BOT_TOKEN);
 const redisClient = redis.createClient({ url: REDIS_URL });
@@ -82,7 +92,7 @@ async function callDeepSeek(prompt) {
         messages: [
           {
             role: 'system',
-            content: '你是一名细致的内容编辑。你的任务是整理用户的日常观点笔记。严格按照用户的原文，不要添加、推理或扩展任何内容。'
+            content: '你是一名资深投资分析师和内容编辑。你的任务是帮用户整理和归纳日常的投资观点。'
           },
           {
             role: 'user',
@@ -106,6 +116,72 @@ async function callDeepSeek(prompt) {
     throw error;
   }
 }
+
+// ============ 讯飞语音识别 ============
+
+async function recognizeVoice(audioBuffer) {
+  try {
+    if (!XFYUN_APPID || !XFYUN_API_KEY) {
+      throw new Error('讯飞配置缺失');
+    }
+
+    // 使用讯飞的 HTTP API
+    const timestamp = Math.floor(Date.now() / 1000);
+    const crypto = require('crypto');
+    
+    // 生成签名
+    const signStr = `${XFYUN_APPID}${timestamp}`;
+    const md5 = crypto.createHash('md5').update(signStr + XFYUN_API_SECRET).digest('hex');
+    const checksum = md5;
+
+    // 发送到讯飞 API
+    const response = await axios.post(
+      'https://api.xfyun.cn/v1/service/v1/asr',
+      audioBuffer,
+      {
+        headers: {
+          'Content-Type': 'audio/wav',
+          'X-Appid': XFYUN_APPID,
+          'X-CurTime': timestamp,
+          'X-CheckSum': checksum,
+          'X-Real-Ip': '127.0.0.1',
+        },
+        timeout: 30000,
+      }
+    );
+
+    if (response.data.code === '0') {
+      const result = response.data.data?.result || [];
+      let text = '';
+      for (const item of result) {
+        if (item.rec_result) {
+          text += item.rec_result;
+        }
+      }
+      return text || '无法识别内容';
+    } else {
+      throw new Error(`讯飞返回错误: ${response.data.message}`);
+    }
+  } catch (error) {
+    console.error('讯飞语音识别错误:', error.message);
+    throw new Error(`语音识别失败: ${error.message}`);
+  }
+}
+
+async function downloadFile(fileUrl) {
+  try {
+    const response = await axios.get(fileUrl, { 
+      responseType: 'arraybuffer',
+      timeout: 30000 
+    });
+    return response.data;
+  } catch (error) {
+    console.error('文件下载错误:', error.message);
+    throw error;
+  }
+}
+
+// ============ 每日总结 ============
 
 async function generateDailySummary() {
   const thoughts = await getTodayThoughts();
@@ -178,44 +254,88 @@ bot.on('message', async msg => {
     return;
   }
 
-  const text = msg.text || '';
+  try {
+    // ============ 处理语音消息 ============
+    if (msg.voice) {
+      await bot.sendMessage(YOUR_CHAT_ID, '🎙️ 正在识别语音...');
+      
+      try {
+        // 获取语音文件
+        const fileId = msg.voice.file_id;
+        const file = await bot.getFile(fileId);
+        const filePath = file.file_path;
+        const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+        
+        // 下载语音文件
+        const audioBuffer = await downloadFile(fileUrl);
+        
+        // 识别语音
+        const recognizedText = await recognizeVoice(audioBuffer);
+        
+        // 提取标签（从消息的 caption 中）
+        const caption = msg.caption || '';
+        const tags = extractTags(caption);
+        
+        // 保存为观点
+        await saveThought(recognizedText, tags);
+        
+        await bot.sendMessage(YOUR_CHAT_ID, 
+          `✓ 已保存${tags.length > 0 ? ' ' + tags.join(' ') : ''}\n\n📝 识别内容：${recognizedText}`
+        );
+      } catch (error) {
+        console.error('语音处理错误:', error);
+        await bot.sendMessage(YOUR_CHAT_ID, `❌ 语音识别失败：${error.message}`);
+      }
+      return;
+    }
 
-  if (text === '/today' || text === '/今天') {
-    const thoughts = await getTodayThoughts();
-    const thoughtsList = thoughts
-      .reverse()
-      .map(t => `⏰ ${t.timestamp}\n${t.content}${t.tags.length > 0 ? ` ${t.tags.join(' ')}` : ''}`)
-      .join('\n\n');
+    // ============ 处理文字消息 ============
+    const text = msg.text || '';
 
-    const reply = thoughts.length === 0 
-      ? '今天暂无观点'
-      : `📝 今天共 ${thoughts.length} 条观点：\n\n${thoughtsList}`;
+    // 命令处理
+    if (text === '/today' || text === '/今天') {
+      const thoughts = await getTodayThoughts();
+      const thoughtsList = thoughts
+        .reverse()
+        .map(t => `⏰ ${t.timestamp}\n${t.content}${t.tags.length > 0 ? ` ${t.tags.join(' ')}` : ''}`)
+        .join('\n\n');
 
-    await bot.sendMessage(YOUR_CHAT_ID, reply);
-    return;
-  }
+      const reply = thoughts.length === 0 
+        ? '今天暂无观点'
+        : `📝 今天共 ${thoughts.length} 条观点：\n\n${thoughtsList}`;
 
-  if (text === '/summary' || text === '/总结') {
-    await bot.sendMessage(YOUR_CHAT_ID, '⏳ 正在生成总结...');
-    await sendDailySummary();
-    return;
-  }
+      await bot.sendMessage(YOUR_CHAT_ID, reply);
+      return;
+    }
 
-  if (text === '/clear') {
-    const key = getTodayKey();
-    await redisClient.del(key);
-    await bot.sendMessage(YOUR_CHAT_ID, '✓ 今日观点已清空');
-    return;
-  }
+    if (text === '/summary' || text === '/总结') {
+      await bot.sendMessage(YOUR_CHAT_ID, '⏳ 正在生成总结...');
+      await sendDailySummary();
+      return;
+    }
 
-  if (text === '/help' || text === '/帮助') {
-    await bot.sendMessage(YOUR_CHAT_ID, `
+    if (text === '/clear') {
+      const key = getTodayKey();
+      await redisClient.del(key);
+      await bot.sendMessage(YOUR_CHAT_ID, '✓ 今日观点已清空');
+      return;
+    }
+
+    if (text === '/help' || text === '/帮助') {
+      await bot.sendMessage(YOUR_CHAT_ID, `
 <b>命令列表：</b>
 
 <b>日常操作：</b>
 - 直接发送消息 = 保存观点
   例：#投资 光伏逆变器价格战...
   （自动提取 #投资 标签）
+
+- 发送语音 = 语音转文字自动保存
+  例：[录音语音] 可选加标签 #投资
+
+<b>实时聊天：</b>
+- 消息前加 ? 来提问（AI 实时回复）
+  例：? ASML 的护城河是什么
 
 <b>查看与导出：</b>
 /today - 查看今日所有观点
@@ -227,12 +347,32 @@ bot.on('message', async msg => {
 
 每日自动生成总结时间：UTC 15:00（北京时间 23:00）
 `, { parse_mode: 'HTML' });
-    return;
-  }
+      return;
+    }
 
-  const tags = extractTags(text);
-  await saveThought(text, tags);
-  await bot.sendMessage(YOUR_CHAT_ID, `✓ 已保存 ${tags.length > 0 ? tags.join(' ') : '(无标签)'}`);
+    // ============ 处理实时聊天（? 前缀） ============
+    if (text.startsWith('?')) {
+      const question = text.substring(1).trim();
+      await bot.sendMessage(YOUR_CHAT_ID, '⏳ 思考中...');
+      
+      try {
+        const response = await callDeepSeek(question);
+        await bot.sendMessage(YOUR_CHAT_ID, response);
+      } catch (error) {
+        await bot.sendMessage(YOUR_CHAT_ID, `❌ 回复失败：${error.message}`);
+      }
+      return;
+    }
+
+    // ============ 处理普通观点消息 ============
+    const tags = extractTags(text);
+    await saveThought(text, tags);
+    await bot.sendMessage(YOUR_CHAT_ID, `✓ 已保存 ${tags.length > 0 ? tags.join(' ') : '(无标签)'}`);
+
+  } catch (error) {
+    console.error('消息处理错误:', error);
+    await bot.sendMessage(YOUR_CHAT_ID, `❌ 处理失败：${error.message}`);
+  }
 });
 
 // ============ 定时任务 ============
@@ -280,6 +420,7 @@ const server = app.listen(PORT, () => {
   console.log(`📡 服务器运行在端口 ${PORT}`);
   console.log(`🤖 Telegram Bot ID: ${YOUR_CHAT_ID}`);
   console.log(`💾 Redis: ${REDIS_URL ? '已连接' : '未配置'}`);
+  console.log(`🎙️ 讯飞语音识别: ${XFYUN_APPID ? '已配置' : '未配置'}`);
   console.log(`🔄 每日总结时间: UTC 15:00 (北京时间 23:00)\n`);
 
   bot.startPolling();
