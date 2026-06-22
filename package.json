@@ -1,0 +1,25 @@
+{
+  "name": "daily-thoughts-digest",
+  "version": "1.0.0",
+  "description": "Daily thoughts aggregation system with Telegram, Redis, and DeepSeek",
+  "main": "telegram-daily-digest.js",
+  "type": "module",
+  "scripts": {
+    "start": "node telegram-daily-digest.js",
+    "dev": "nodemon telegram-daily-digest.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-telegram-bot-api": "^0.61.0",
+    "redis": "^4.6.12",
+    "axios": "^1.6.7",
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
