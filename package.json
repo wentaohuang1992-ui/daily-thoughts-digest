@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "description": "Daily thoughts aggregation system with Telegram, Redis, and DeepSeek",
   "main": "telegram-daily-digest.js",
-  "type": "module",
   "scripts": {
     "start": "node telegram-daily-digest.js",
     "dev": "nodemon telegram-daily-digest.js"
