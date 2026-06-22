@@ -278,7 +278,7 @@ bot.on('message', async msg => {
  * 每日 00:00 UTC 生成总结
  * 北京时间 08:00
  */
-cron.schedule('0 0 * * *', async () => {
+cron.schedule('0 15 * * *', async () => {
   console.log('⏰ 触发每日总结任务...');
   await sendDailySummary();
 });
