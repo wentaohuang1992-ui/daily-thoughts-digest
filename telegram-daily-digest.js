@@ -405,6 +405,38 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ============ 测试阿里云连接 ============
+app.get('/test-aliyun', async (req, res) => {
+  try {
+    console.log('🧪 测试阿里云连接...');
+    
+    // 测试连接
+    const pingResponse = await axios.get('https://intelligentspeech.aliyuncs.com', {
+      timeout: 5000,
+      validateStatus: () => true
+    });
+    
+    console.log(`✓ 可以连接到阿里云，状态码: ${pingResponse.status}`);
+    
+    res.json({ 
+      success: true, 
+      message: '✓ 可以连接到阿里云',
+      status: pingResponse.status,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('❌ 无法连接到阿里云:', error.message);
+    
+    res.json({ 
+      success: false, 
+      message: `❌ 无法连接到阿里云: ${error.message}`,
+      error: error.code,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// ============ 查询历史总结 ============
 app.get('/summary/:date', async (req, res) => {
   try {
     const { date } = req.params;
@@ -416,6 +448,7 @@ app.get('/summary/:date', async (req, res) => {
   }
 });
 
+// ============ 手动触发总结 ============
 app.post('/trigger-summary', async (req, res) => {
   try {
     await sendDailySummary();
@@ -433,7 +466,8 @@ const server = app.listen(PORT, () => {
   console.log(`🤖 Telegram Bot ID: ${YOUR_CHAT_ID}`);
   console.log(`💾 Redis: ${REDIS_URL ? '已连接' : '未配置'}`);
   console.log(`🎙️ 语音识别: 阿里云（${ALIYUN_ACCESS_KEY_ID ? '已配置' : '未配置'}）`);
-  console.log(`🔄 每日总结时间: UTC 15:00 (北京时间 23:00)\n`);
+  console.log(`🔄 每日总结时间: UTC 15:00 (北京时间 23:00)`);
+  console.log(`🧪 测试端点: /test-aliyun\n`);
 
   bot.startPolling();
 });
