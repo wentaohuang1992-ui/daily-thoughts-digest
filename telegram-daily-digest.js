@@ -1,12 +1,8 @@
 /**
- * 每日观点自动归纳系统
- * 功能：
- * - Telegram Bot 接收文字观点、语音消息
- * - 实时聊天（? 前缀提问）
- * - 阿里云语音识别（免费）
- * - Redis 存储
- * - DeepSeek 每日AI归纳
- * - Railway 部署
+ * 每日观点自动归纳系统 - Railway 版本
+ * - 百度云短语音识别
+ * - Telegram Polling（Railway 支持长连接）
+ * - Upstash Redis (TLS)
  */
 
 const express = require('express');
@@ -16,8 +12,6 @@ const axios = require('axios');
 const cron = require('node-cron');
 const dotenv = require('dotenv');
 const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
 
 dotenv.config();
 
@@ -26,26 +20,79 @@ app.use(express.json());
 
 // ============ 配置 ============
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const YOUR_CHAT_ID = parseInt(process.env.TELEGRAM_CHAT_ID);
+const YOUR_CHAT_ID = parseInt(process.env.MY_CHAT_ID || process.env.TELEGRAM_CHAT_ID);
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/chat/completions';
-const REDIS_URL = process.env.REDIS_URL;
 const PORT = process.env.PORT || 3000;
 
-// 阿里云配置
-const ALIYUN_ACCESS_KEY_ID = process.env.ALIYUN_ACCESS_KEY_ID;
-const ALIYUN_ACCESS_KEY_SECRET = process.env.ALIYUN_ACCESS_KEY_SECRET;
+// Redis - Upstash TLS
+const REDIS_URL = process.env.REDIS_URL;
 
-const bot = new TelegramBot(BOT_TOKEN);
-const redisClient = redis.createClient({ url: REDIS_URL });
+// 百度语音识别配置
+const BAIDU_APP_ID = process.env.BAIDU_APP_ID;
+const BAIDU_API_KEY = process.env.BAIDU_API_KEY;
+const BAIDU_SECRET_KEY = process.env.BAIDU_SECRET_KEY;
+const BAIDU_TOKEN_URL = 'https://aip.baidubce.com/oauth/2.0/token';
+const BAIDU_ASR_URL = 'http://vop.baidu.com/server_api';
+
+// 创建 Bot 实例（使用 polling）
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+// 创建 Redis 客户端（支持 TLS）
+const redisClient = redis.createClient({ 
+  url: REDIS_URL,
+  socket: {
+    tls: REDIS_URL && REDIS_URL.startsWith('rediss://'),
+    rejectUnauthorized: false,
+  }
+});
 
 // ============ Redis 初始化 ============
-redisClient.on('error', err => console.error('Redis error:', err));
+redisClient.on('error', err => console.error('Redis error:', err.message));
 redisClient.on('connect', () => console.log('✓ Redis connected'));
 
 (async () => {
-  await redisClient.connect();
+  try {
+    await redisClient.connect();
+  } catch (error) {
+    console.error('Redis 连接失败:', error.message);
+  }
 })();
+
+// ============ 百度 Token 管理 ============
+let baiduAccessToken = null;
+let baiduTokenExpireTime = 0;
+
+async function getBaiduAccessToken() {
+  try {
+    if (baiduAccessToken && Date.now() < (baiduTokenExpireTime - 60000)) {
+      return baiduAccessToken;
+    }
+
+    console.log('🔄 获取百度 Access Token...');
+
+    const response = await axios.post(BAIDU_TOKEN_URL, null, {
+      params: {
+        grant_type: 'client_credentials',
+        client_id: BAIDU_API_KEY,
+        client_secret: BAIDU_SECRET_KEY,
+      },
+      timeout: 10000,
+    });
+
+    if (response.data && response.data.access_token) {
+      baiduAccessToken = response.data.access_token;
+      baiduTokenExpireTime = Date.now() + (response.data.expires_in * 1000);
+      console.log('✓ 百度 Token 获取成功');
+      return baiduAccessToken;
+    } else {
+      throw new Error(`获取 Token 失败: ${JSON.stringify(response.data)}`);
+    }
+  } catch (error) {
+    console.error('获取百度 Token 错误:', error.message);
+    throw new Error(`百度认证失败: ${error.message}`);
+  }
+}
 
 // ============ 辅助函数 ============
 
@@ -54,13 +101,9 @@ function extractTags(text) {
   return text.match(tagRegex) || [];
 }
 
-function getThoughtKey(date) {
-  return `thoughts:${date}`;
-}
-
 function getTodayKey() {
   const today = new Date().toISOString().split('T')[0];
-  return getThoughtKey(today);
+  return `thoughts:${today}`;
 }
 
 async function saveThought(content, tags = []) {
@@ -117,56 +160,59 @@ async function callDeepSeek(prompt) {
   }
 }
 
-// ============ 阿里云语音识别 ============
+// ============ 百度语音识别 ============
 
-async function recognizeVoiceWithAliyun(audioFilePath) {
+async function recognizeVoiceWithBaidu(audioFilePath) {
   try {
-    console.log(`🎙️ 使用阿里云语音识别: ${audioFilePath}`);
-    
-    if (!ALIYUN_ACCESS_KEY_ID || !ALIYUN_ACCESS_KEY_SECRET) {
-      throw new Error('阿里云配置缺失（ALIYUN_ACCESS_KEY_ID 或 ALIYUN_ACCESS_KEY_SECRET）');
+    console.log(`🎙️ 使用百度语音识别: ${audioFilePath}`);
+
+    if (!BAIDU_APP_ID || !BAIDU_API_KEY || !BAIDU_SECRET_KEY) {
+      throw new Error('百度凭证配置缺失');
     }
 
-    // 读取音频文件
+    const token = await getBaiduAccessToken();
+
     const audioData = fs.readFileSync(audioFilePath);
+    console.log(`音频大小: ${audioData.length} 字节`);
+
     const base64Audio = audioData.toString('base64');
 
-    // 调用阿里云 API
-    const timestamp = new Date().toISOString();
-    const headers = {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
+    const requestBody = {
+      format: 'ogg',
+      rate: 16000,
+      dev_pid: 1537,
+      channel: 1,
+      cuid: `telegram_${YOUR_CHAT_ID}`,
+      token: token,
+      len: audioData.length,
+      speech: base64Audio,
     };
 
-    // 构建请求体
-    const payload = {
-      audio: base64Audio,
-      format: 'OGG',
-      sampleRate: 16000,
-      enablePunctuation: true,
-      language: 'zh-CN',
-    };
+    console.log('向百度语音识别 API 发送请求...');
 
-    // 调用阿里云 AI 语音识别 API
-    const response = await axios.post(
-      'https://intelligentspeech.aliyuncs.com/openapi/recognizeShortAudio',
-      payload,
-      { headers, timeout: 30000 }
-    );
+    const response = await axios.post(BAIDU_ASR_URL, requestBody, {
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      timeout: 30000,
+    });
 
-    if (response.data && response.data.success === true) {
-      const text = response.data.result?.text || response.data.data?.text || '无法识别内容';
-      console.log(`✓ 识别成功: ${text}`);
-      return text;
-    } else if (response.data && response.data.result?.text) {
-      const text = response.data.result.text;
-      console.log(`✓ 识别成功: ${text}`);
-      return text;
-    } else {
-      throw new Error(`阿里云返回错误: ${JSON.stringify(response.data)}`);
+    console.log('百度响应:', response.data);
+
+    if (response.data.err_no !== 0) {
+      throw new Error(`百度 API 错误 (${response.data.err_no}): ${response.data.err_msg}`);
     }
+
+    if (response.data.result && response.data.result.length > 0) {
+      const recognizedText = response.data.result[0];
+      console.log(`✓ 识别成功: ${recognizedText}`);
+      return recognizedText;
+    } else {
+      throw new Error('百度未返回识别结果');
+    }
+
   } catch (error) {
-    console.error('阿里云语音识别错误:', error.message);
+    console.error('百度语音识别错误:', error.message);
     throw new Error(`语音识别失败: ${error.message}`);
   }
 }
@@ -222,7 +268,7 @@ ${thoughtsText}
 
 输出格式示例：
 【标签分类】
-- 用户观点原文
+• 用户观点原文
   💡 可复用部分
 
 标签：#投资 #技术 #供应链`;
@@ -251,7 +297,7 @@ async function sendDailySummary() {
   }
 }
 
-// ============ Telegram Bot 事件处理 ============
+// ============ Telegram Bot 消息处理 ============
 
 bot.on('message', async msg => {
   if (msg.chat.id !== YOUR_CHAT_ID) {
@@ -259,36 +305,28 @@ bot.on('message', async msg => {
   }
 
   try {
-    // ============ 处理语音消息 ============
+    // 语音消息
     if (msg.voice) {
       await bot.sendMessage(YOUR_CHAT_ID, '🎙️ 正在识别语音...');
       
       try {
-        // 获取语音文件
         const fileId = msg.voice.file_id;
         const file = await bot.getFile(fileId);
         const filePath = file.file_path;
         const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
         
-        // 下载语音文件到临时位置
         const tempAudioPath = `/tmp/voice_${Date.now()}.ogg`;
         await downloadFile(fileUrl, tempAudioPath);
         
-        // 识别语音
-        const recognizedText = await recognizeVoiceWithAliyun(tempAudioPath);
+        const recognizedText = await recognizeVoiceWithBaidu(tempAudioPath);
         
-        // 清理临时文件
         try {
           fs.unlinkSync(tempAudioPath);
-        } catch (e) {
-          console.error('删除临时文件失败:', e);
-        }
+        } catch (e) {}
         
-        // 提取标签（从消息的 caption 中）
         const caption = msg.caption || '';
         const tags = extractTags(caption);
         
-        // 保存为观点
         await saveThought(recognizedText, tags);
         
         await bot.sendMessage(YOUR_CHAT_ID, 
@@ -301,10 +339,9 @@ bot.on('message', async msg => {
       return;
     }
 
-    // ============ 处理文字消息 ============
+    // 文字消息
     const text = msg.text || '';
 
-    // 命令处理
     if (text === '/today' || text === '/今天') {
       const thoughts = await getTodayThoughts();
       const thoughtsList = thoughts
@@ -333,36 +370,26 @@ bot.on('message', async msg => {
       return;
     }
 
-    if (text === '/help' || text === '/帮助') {
+    if (text === '/help' || text === '/帮助' || text === '/start') {
       await bot.sendMessage(YOUR_CHAT_ID, `
 <b>命令列表：</b>
 
 <b>日常操作：</b>
-- 直接发送消息 = 保存观点
-  例：#投资 光伏逆变器价格战...
-  （自动提取 #投资 标签）
-
-- 发送语音 = 语音转文字自动保存
-  例：[录音语音] 可选加标签 #投资
-
-<b>实时聊天：</b>
-- 消息前加 ? 来提问（AI 实时回复）
-  例：? ASML 的护城河是什么
+• 直接发送消息 = 保存观点
+• 发送语音 = 语音转文字自动保存
+• 消息前加 ? = 实时聊天
 
 <b>查看与导出：</b>
 /today - 查看今日所有观点
 /summary - 立即生成今日总结
 /clear - 清空今日观点
 
-<b>系统：</b>
-/help - 显示此帮助
-
 每日自动生成总结时间：UTC 15:00（北京时间 23:00）
 `, { parse_mode: 'HTML' });
       return;
     }
 
-    // ============ 处理实时聊天（? 前缀） ============
+    // 实时聊天
     if (text.startsWith('?')) {
       const question = text.substring(1).trim();
       await bot.sendMessage(YOUR_CHAT_ID, '⏳ 思考中...');
@@ -376,7 +403,7 @@ bot.on('message', async msg => {
       return;
     }
 
-    // ============ 处理普通观点消息 ============
+    // 保存观点
     const tags = extractTags(text);
     await saveThought(text, tags);
     await bot.sendMessage(YOUR_CHAT_ID, `✓ 已保存 ${tags.length > 0 ? tags.join(' ') : '(无标签)'}`);
@@ -387,8 +414,12 @@ bot.on('message', async msg => {
   }
 });
 
+// 处理 polling 错误
+bot.on('polling_error', (error) => {
+  console.error('Polling error:', error.message);
+});
+
 // ============ 定时任务 ============
-// 北京时间 23:00 = UTC 15:00
 cron.schedule('0 15 * * *', async () => {
   console.log('⏰ 触发每日总结任务...');
   await sendDailySummary();
@@ -396,59 +427,41 @@ cron.schedule('0 15 * * *', async () => {
 
 // ============ Express 服务器 ============
 
-app.post('/webhook', (req, res) => {
-  bot.processUpdate(req.body);
-  res.sendStatus(200);
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    message: '每日观点归纳系统运行中',
+    timestamp: new Date().toISOString()
+  });
 });
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ============ 测试阿里云连接 ============
-app.get('/test-aliyun', async (req, res) => {
+app.get('/test-baidu', async (req, res) => {
   try {
-    console.log('🧪 测试阿里云连接...');
-    
-    // 测试连接
-    const pingResponse = await axios.get('https://intelligentspeech.aliyuncs.com', {
-      timeout: 5000,
-      validateStatus: () => true
-    });
-    
-    console.log(`✓ 可以连接到阿里云，状态码: ${pingResponse.status}`);
-    
+    if (!BAIDU_APP_ID || !BAIDU_API_KEY || !BAIDU_SECRET_KEY) {
+      throw new Error('百度凭证未配置');
+    }
+
+    const token = await getBaiduAccessToken();
+
     res.json({ 
       success: true, 
-      message: '✓ 可以连接到阿里云',
-      status: pingResponse.status,
+      message: '✓ 百度语音识别连接成功',
+      token_preview: token.substring(0, 20) + '...',
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    console.error('❌ 无法连接到阿里云:', error.message);
-    
     res.json({ 
       success: false, 
-      message: `❌ 无法连接到阿里云: ${error.message}`,
-      error: error.code,
+      message: `❌ 百度语音识别连接失败: ${error.message}`,
       timestamp: new Date().toISOString()
     });
   }
 });
 
-// ============ 查询历史总结 ============
-app.get('/summary/:date', async (req, res) => {
-  try {
-    const { date } = req.params;
-    const key = `summary:${date}`;
-    const summary = await redisClient.get(key);
-    res.json({ date, summary: summary || null });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============ 手动触发总结 ============
 app.post('/trigger-summary', async (req, res) => {
   try {
     await sendDailySummary();
@@ -461,23 +474,17 @@ app.post('/trigger-summary', async (req, res) => {
 // ============ 启动 ============
 
 const server = app.listen(PORT, () => {
-  console.log(`\n🚀 每日观点归纳系统启动`);
+  console.log(`\n🚀 每日观点归纳系统启动（Railway 版）`);
   console.log(`📡 服务器运行在端口 ${PORT}`);
   console.log(`🤖 Telegram Bot ID: ${YOUR_CHAT_ID}`);
-  console.log(`💾 Redis: ${REDIS_URL ? '已连接' : '未配置'}`);
-  console.log(`🎙️ 语音识别: 阿里云（${ALIYUN_ACCESS_KEY_ID ? '已配置' : '未配置'}）`);
+  console.log(`💾 Redis: ${REDIS_URL ? '已配置' : '未配置'}`);
+  console.log(`🎙️ 语音识别: 百度云短语音识别`);
   console.log(`🔄 每日总结时间: UTC 15:00 (北京时间 23:00)`);
-  console.log(`🧪 测试端点: /test-aliyun\n`);
+  console.log(`📲 Telegram 模式: Polling\n`);
 
-  bot.startPolling();
-});
-
-process.on('SIGINT', async () => {
-  console.log('\n关闭中...');
-  bot.stopPolling();
-  await redisClient.quit();
-  server.close(() => {
-    console.log('已关闭');
-    process.exit(0);
-  });
+  console.log(`✓ 系统运行中`);
+  console.log(`📍 可用端点：`);
+  console.log(`   • GET  /health - 健康检查`);
+  console.log(`   • GET  /test-baidu - 测试百度连接`);
+  console.log(`   • POST /trigger-summary - 手动触发总结\n`);
 });
