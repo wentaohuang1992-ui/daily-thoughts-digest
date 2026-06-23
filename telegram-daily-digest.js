@@ -1,8 +1,5 @@
 /**
- * 每日观点自动归纳系统 - Railway 版本
- * - 百度云短语音识别
- * - Telegram Polling（Railway 支持长连接）
- * - Upstash Redis (TLS)
+ * 每日观点自动归纳系统 - Railway 版本（带 FFmpeg 音频转换）
  */
 
 const express = require('express');
@@ -12,8 +9,13 @@ const axios = require('axios');
 const cron = require('node-cron');
 const dotenv = require('dotenv');
 const fs = require('fs');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegStatic = require('ffmpeg-static');
 
 dotenv.config();
+
+// 设置 ffmpeg 路径
+ffmpeg.setFfmpegPath(ffmpegStatic);
 
 const app = express();
 app.use(express.json());
@@ -25,20 +27,16 @@ const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/chat/completions';
 const PORT = process.env.PORT || 3000;
 
-// Redis - Upstash TLS
 const REDIS_URL = process.env.REDIS_URL;
 
-// 百度语音识别配置
 const BAIDU_APP_ID = process.env.BAIDU_APP_ID;
 const BAIDU_API_KEY = process.env.BAIDU_API_KEY;
 const BAIDU_SECRET_KEY = process.env.BAIDU_SECRET_KEY;
 const BAIDU_TOKEN_URL = 'https://aip.baidubce.com/oauth/2.0/token';
 const BAIDU_ASR_URL = 'http://vop.baidu.com/server_api';
 
-// 创建 Bot 实例（使用 polling）
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// 创建 Redis 客户端（支持 TLS）
 const redisClient = redis.createClient({ 
   url: REDIS_URL,
   socket: {
@@ -47,7 +45,6 @@ const redisClient = redis.createClient({
   }
 });
 
-// ============ Redis 初始化 ============
 redisClient.on('error', err => console.error('Redis error:', err.message));
 redisClient.on('connect', () => console.log('✓ Redis connected'));
 
@@ -92,6 +89,28 @@ async function getBaiduAccessToken() {
     console.error('获取百度 Token 错误:', error.message);
     throw new Error(`百度认证失败: ${error.message}`);
   }
+}
+
+// ============ 音频格式转换 ============
+function convertOggToWav(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    console.log(`🔄 转换音频: ${inputPath} -> ${outputPath}`);
+    
+    ffmpeg(inputPath)
+      .audioCodec('pcm_s16le')
+      .audioFrequency(16000)
+      .audioChannels(1)
+      .format('wav')
+      .on('end', () => {
+        console.log('✓ 音频转换完成');
+        resolve(outputPath);
+      })
+      .on('error', (err) => {
+        console.error('❌ 音频转换失败:', err.message);
+        reject(new Error(`音频转换失败: ${err.message}`));
+      })
+      .save(outputPath);
+  });
 }
 
 // ============ 辅助函数 ============
@@ -178,7 +197,7 @@ async function recognizeVoiceWithBaidu(audioFilePath) {
     const base64Audio = audioData.toString('base64');
 
     const requestBody = {
-      format: 'ogg',
+      format: 'wav',
       rate: 16000,
       dev_pid: 1537,
       channel: 1,
@@ -309,20 +328,22 @@ bot.on('message', async msg => {
     if (msg.voice) {
       await bot.sendMessage(YOUR_CHAT_ID, '🎙️ 正在识别语音...');
       
+      const timestamp = Date.now();
+      const tempOggPath = `/tmp/voice_${timestamp}.ogg`;
+      const tempWavPath = `/tmp/voice_${timestamp}.wav`;
+      
       try {
         const fileId = msg.voice.file_id;
         const file = await bot.getFile(fileId);
         const filePath = file.file_path;
         const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
         
-        const tempAudioPath = `/tmp/voice_${Date.now()}.ogg`;
-        await downloadFile(fileUrl, tempAudioPath);
+        await downloadFile(fileUrl, tempOggPath);
+        await convertOggToWav(tempOggPath, tempWavPath);
+        const recognizedText = await recognizeVoiceWithBaidu(tempWavPath);
         
-        const recognizedText = await recognizeVoiceWithBaidu(tempAudioPath);
-        
-        try {
-          fs.unlinkSync(tempAudioPath);
-        } catch (e) {}
+        try { fs.unlinkSync(tempOggPath); } catch (e) {}
+        try { fs.unlinkSync(tempWavPath); } catch (e) {}
         
         const caption = msg.caption || '';
         const tags = extractTags(caption);
@@ -334,6 +355,10 @@ bot.on('message', async msg => {
         );
       } catch (error) {
         console.error('语音处理错误:', error);
+        
+        try { fs.unlinkSync(tempOggPath); } catch (e) {}
+        try { fs.unlinkSync(tempWavPath); } catch (e) {}
+        
         await bot.sendMessage(YOUR_CHAT_ID, `❌ 语音识别失败：${error.message}`);
       }
       return;
@@ -389,7 +414,6 @@ bot.on('message', async msg => {
       return;
     }
 
-    // 实时聊天
     if (text.startsWith('?')) {
       const question = text.substring(1).trim();
       await bot.sendMessage(YOUR_CHAT_ID, '⏳ 思考中...');
@@ -403,7 +427,6 @@ bot.on('message', async msg => {
       return;
     }
 
-    // 保存观点
     const tags = extractTags(text);
     await saveThought(text, tags);
     await bot.sendMessage(YOUR_CHAT_ID, `✓ 已保存 ${tags.length > 0 ? tags.join(' ') : '(无标签)'}`);
@@ -414,18 +437,14 @@ bot.on('message', async msg => {
   }
 });
 
-// 处理 polling 错误
 bot.on('polling_error', (error) => {
   console.error('Polling error:', error.message);
 });
 
-// ============ 定时任务 ============
 cron.schedule('0 15 * * *', async () => {
   console.log('⏰ 触发每日总结任务...');
   await sendDailySummary();
 });
-
-// ============ Express 服务器 ============
 
 app.get('/', (req, res) => {
   res.json({ 
@@ -471,14 +490,12 @@ app.post('/trigger-summary', async (req, res) => {
   }
 });
 
-// ============ 启动 ============
-
 const server = app.listen(PORT, () => {
   console.log(`\n🚀 每日观点归纳系统启动（Railway 版）`);
   console.log(`📡 服务器运行在端口 ${PORT}`);
   console.log(`🤖 Telegram Bot ID: ${YOUR_CHAT_ID}`);
   console.log(`💾 Redis: ${REDIS_URL ? '已配置' : '未配置'}`);
-  console.log(`🎙️ 语音识别: 百度云短语音识别`);
+  console.log(`🎙️ 语音识别: 百度云短语音识别（带 FFmpeg 转换）`);
   console.log(`🔄 每日总结时间: UTC 15:00 (北京时间 23:00)`);
   console.log(`📲 Telegram 模式: Polling\n`);
 
