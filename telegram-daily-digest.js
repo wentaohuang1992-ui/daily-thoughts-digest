@@ -117,10 +117,15 @@ function convertOggToWav(inputPath, outputPath) {
       .audioFrequency(16000)
       .audioChannels(1)
       .format('wav')
-      .on('end', () => resolve(outputPath))
-      .on('error', (err) => reject(new Error(`音频转换失败: ${err.message}`)));
-    
-    ffmpeg(inputPath).save(outputPath);
+      .on('end', () => {
+        console.log('✓ 音频转换完成');
+        resolve(outputPath);
+      })
+      .on('error', (err) => {
+        console.error('❌ 音频转换失败:', err.message);
+        reject(new Error(`音频转换失败: ${err.message}`));
+      })
+      .save(outputPath);
   });
 }
 
