@@ -390,20 +390,20 @@ ${thoughtsText}
   return await callDeepSeek(prompt);
 }
 
-async function sendDailySummary(silent = false) {
+async function sendDailySummary(silent = false, chatId = YOUR_CHAT_ID) {
   try {
     const summary = await generateDailySummary();
     const today = getDateString();
 
     if (!summary) {
       if (!silent) {
-        await bot.sendMessage(YOUR_CHAT_ID, '📝 今天还没有记录。');
+        await bot.sendMessage(chatId, '📝 今天还没有记录。');
       }
       return;
     }
 
     const message = `📊 <b>今日回顾 - ${today}</b>\n\n${summary}`;
-    await bot.sendMessage(YOUR_CHAT_ID, message, { parse_mode: 'HTML' });
+    await bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
 
     const archiveKey = `summary:${today}`;
     await redisClient.set(archiveKey, summary, { EX: 365 * 24 * 60 * 60 });
@@ -412,7 +412,7 @@ async function sendDailySummary(silent = false) {
   } catch (error) {
     console.error('Failed to send daily summary:', error);
     if (!silent) {
-      await bot.sendMessage(YOUR_CHAT_ID, `❌ 总结生成失败：${error.message}`);
+      await bot.sendMessage(chatId, `❌ 总结生成失败：${error.message}`);
     }
   }
 }
@@ -468,12 +468,12 @@ ${thoughtsText}
   return await callDeepSeek(prompt);
 }
 
-async function sendWeeklyReview() {
+async function sendWeeklyReview(chatId = YOUR_CHAT_ID) {
   try {
     const review = await generateWeeklyReview();
     
     if (!review) {
-      await bot.sendMessage(YOUR_CHAT_ID, '📝 本周还没有足够的记录可以回顾。');
+      await bot.sendMessage(chatId, '📝 本周还没有足够的记录可以回顾。');
       return;
     }
 
@@ -486,7 +486,7 @@ async function sendWeeklyReview() {
     const weekRange = `${getDateString(monday)} 至 ${getDateString(now)}`;
 
     const message = `📅 <b>本周回顾</b>\n<i>${weekRange}</i>\n\n${review}`;
-    await bot.sendMessage(YOUR_CHAT_ID, message, { parse_mode: 'HTML' });
+    await bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
 
     const archiveKey = `weekly:${getDateString()}`;
     await redisClient.set(archiveKey, review, { EX: 365 * 24 * 60 * 60 });
@@ -494,7 +494,7 @@ async function sendWeeklyReview() {
     console.log('✓ Weekly review sent');
   } catch (error) {
     console.error('Failed to send weekly review:', error);
-    await bot.sendMessage(YOUR_CHAT_ID, `❌ 周回顾生成失败：${error.message}`);
+    await bot.sendMessage(chatId, `❌ 周回顾生成失败：${error.message}`);
   }
 }
 
@@ -549,12 +549,12 @@ ${thoughtsText}
   return await callDeepSeek(prompt);
 }
 
-async function sendMonthlyReview() {
+async function sendMonthlyReview(chatId = YOUR_CHAT_ID) {
   try {
     const review = await generateMonthlyReview();
     
     if (!review) {
-      await bot.sendMessage(YOUR_CHAT_ID, '📝 本月还没有足够的记录可以回顾。');
+      await bot.sendMessage(chatId, '📝 本月还没有足够的记录可以回顾。');
       return;
     }
 
@@ -562,7 +562,7 @@ async function sendMonthlyReview() {
     const monthStr = `${now.getFullYear()}年${now.getMonth() + 1}月`;
 
     const message = `🗓 <b>${monthStr}回顾</b>\n\n${review}`;
-    await bot.sendMessage(YOUR_CHAT_ID, message, { parse_mode: 'HTML' });
+    await bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
 
     const archiveKey = `monthly:${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
     await redisClient.set(archiveKey, review, { EX: 365 * 24 * 60 * 60 });
@@ -570,7 +570,7 @@ async function sendMonthlyReview() {
     console.log('✓ Monthly review sent');
   } catch (error) {
     console.error('Failed to send monthly review:', error);
-    await bot.sendMessage(YOUR_CHAT_ID, `❌ 月回顾生成失败：${error.message}`);
+    await bot.sendMessage(chatId, `❌ 月回顾生成失败：${error.message}`);
   }
 }
 
@@ -602,7 +602,16 @@ bot.on('message', async msg => {
   try {
     // 语音消息
     if (msg.voice) {
-      await bot.sendMessage(YOUR_CHAT_ID, '🎙️ 正在识别...');
+      // 检查语音时长（百度短语音最长 60 秒）
+      const duration = msg.voice.duration || 0;
+      if (duration > 60) {
+        await bot.sendMessage(msg.chat.id, 
+          `⚠️ 语音太长了（${duration} 秒）\n\n百度短语音识别限制为 60 秒以内。请分段录制后再发送。`
+        );
+        return;
+      }
+      
+      await bot.sendMessage(msg.chat.id, '🎙️ 正在识别...');
       
       const timestamp = Date.now();
       const tempOggPath = `/tmp/voice_${timestamp}.ogg`;
@@ -627,21 +636,21 @@ bot.on('message', async msg => {
         await saveThought(recognizedText, tags);
         
         // 发送保存确认 + 识别内容
-        await bot.sendMessage(YOUR_CHAT_ID, 
+        await bot.sendMessage(msg.chat.id, 
           `✓ 已保存${tags.length > 0 ? ' ' + tags.join(' ') : ''}\n\n📝 ${recognizedText}`
         );
         
         // AI 判断是否需要追问
         const followUp = await generateFollowUpQuestion(recognizedText);
         if (followUp) {
-          await bot.sendMessage(YOUR_CHAT_ID, `—— ${followUp}`);
+          await bot.sendMessage(msg.chat.id, `—— ${followUp}`);
         }
         
       } catch (error) {
         console.error('语音处理错误:', error);
         try { fs.unlinkSync(tempOggPath); } catch (e) {}
         try { fs.unlinkSync(tempWavPath); } catch (e) {}
-        await bot.sendMessage(YOUR_CHAT_ID, `❌ 识别失败：${error.message}`);
+        await bot.sendMessage(msg.chat.id, `❌ 识别失败：${error.message}`);
       }
       return;
     }
@@ -653,7 +662,7 @@ bot.on('message', async msg => {
     if (text === '/today' || text === '/今天') {
       const thoughts = await getTodayThoughts();
       if (thoughts.length === 0) {
-        await bot.sendMessage(YOUR_CHAT_ID, '今天还没有记录');
+        await bot.sendMessage(msg.chat.id, '今天还没有记录');
         return;
       }
       
@@ -665,37 +674,37 @@ bot.on('message', async msg => {
         })
         .join('\n\n');
       
-      await bot.sendMessage(YOUR_CHAT_ID, `📝 今天共 ${thoughts.length} 条记录：\n\n${list}`);
+      await bot.sendMessage(msg.chat.id, `📝 今天共 ${thoughts.length} 条记录：\n\n${list}`);
       return;
     }
 
     if (text === '/summary' || text === '/总结') {
-      await bot.sendMessage(YOUR_CHAT_ID, '⏳ 正在生成今日回顾...');
-      await sendDailySummary();
+      await bot.sendMessage(msg.chat.id, '⏳ 正在生成今日回顾...');
+      await sendDailySummary(false, msg.chat.id);
       return;
     }
 
     if (text === '/week' || text === '/周') {
-      await bot.sendMessage(YOUR_CHAT_ID, '⏳ 正在生成本周回顾...');
-      await sendWeeklyReview();
+      await bot.sendMessage(msg.chat.id, '⏳ 正在生成本周回顾...');
+      await sendWeeklyReview(msg.chat.id);
       return;
     }
 
     if (text === '/month' || text === '/月') {
-      await bot.sendMessage(YOUR_CHAT_ID, '⏳ 正在生成本月回顾...');
-      await sendMonthlyReview();
+      await bot.sendMessage(msg.chat.id, '⏳ 正在生成本月回顾...');
+      await sendMonthlyReview(msg.chat.id);
       return;
     }
 
     if (text === '/clear') {
       const key = getTodayKey();
       await redisClient.del(key);
-      await bot.sendMessage(YOUR_CHAT_ID, '✓ 今日记录已清空');
+      await bot.sendMessage(msg.chat.id, '✓ 今日记录已清空');
       return;
     }
 
     if (text === '/help' || text === '/帮助' || text === '/start') {
-      await bot.sendMessage(YOUR_CHAT_ID, `
+      await bot.sendMessage(msg.chat.id, `
 <b>📝 个人思考记录系统</b>
 
 <b>日常使用：</b>
@@ -724,13 +733,13 @@ bot.on('message', async msg => {
     // 实时聊天
     if (text.startsWith('?') || text.startsWith('?')) {
       const question = text.substring(1).trim();
-      await bot.sendMessage(YOUR_CHAT_ID, '⏳ 思考中...');
+      await bot.sendMessage(msg.chat.id, '⏳ 思考中...');
       
       try {
         const response = await callDeepSeek(question);
-        await bot.sendMessage(YOUR_CHAT_ID, response);
+        await bot.sendMessage(msg.chat.id, response);
       } catch (error) {
-        await bot.sendMessage(YOUR_CHAT_ID, `❌ 回复失败：${error.message}`);
+        await bot.sendMessage(msg.chat.id, `❌ 回复失败：${error.message}`);
       }
       return;
     }
@@ -738,17 +747,17 @@ bot.on('message', async msg => {
     // 保存观点
     const tags = extractTags(text);
     await saveThought(text, tags);
-    await bot.sendMessage(YOUR_CHAT_ID, `✓ 已保存${tags.length > 0 ? ' ' + tags.join(' ') : ''}`);
+    await bot.sendMessage(msg.chat.id, `✓ 已保存${tags.length > 0 ? ' ' + tags.join(' ') : ''}`);
     
     // AI 判断是否需要追问
     const followUp = await generateFollowUpQuestion(text);
     if (followUp) {
-      await bot.sendMessage(YOUR_CHAT_ID, `—— ${followUp}`);
+      await bot.sendMessage(msg.chat.id, `—— ${followUp}`);
     }
 
   } catch (error) {
     console.error('消息处理错误:', error);
-    await bot.sendMessage(YOUR_CHAT_ID, `❌ 处理失败：${error.message}`);
+    await bot.sendMessage(msg.chat.id, `❌ 处理失败：${error.message}`);
   }
 });
 
