@@ -249,9 +249,9 @@ async function generateFollowUpQuestion(content) {
 
 // ============ 火山引擎语音识别（极速版）============
 
-async function recognizeVoiceWithVolc(audioUrl, audioFormat = 'ogg') {
+async function recognizeVoiceWithVolc(audioBase64, audioFormat = 'ogg') {
   try {
-    console.log(`🎙️ 使用火山引擎识别: ${audioUrl}`);
+    console.log(`🎙️ 使用火山引擎识别，音频大小: ${audioBase64.length} 字符（base64）`);
 
     // 判断使用新版还是旧版鉴权
     const useNewAuth = !!VOLC_API_KEY;
@@ -291,7 +291,7 @@ async function recognizeVoiceWithVolc(audioUrl, audioFormat = 'ogg') {
         uid: `telegram_${YOUR_CHAT_ID}`,
       },
       audio: {
-        url: audioUrl,
+        data: audioBase64,
         format: audioFormat,
       },
       request: {
@@ -307,6 +307,7 @@ async function recognizeVoiceWithVolc(audioUrl, audioFormat = 'ogg') {
     const response = await axios.post(VOLC_ASR_URL, requestBody, {
       headers,
       timeout: 60000,
+      maxBodyLength: 100 * 1024 * 1024, // 允许 100MB 请求体
     });
 
     console.log('火山引擎响应 status:', response.status);
@@ -325,13 +326,11 @@ async function recognizeVoiceWithVolc(audioUrl, audioFormat = 'ogg') {
     if (response.data && response.data.result) {
       const result = response.data.result;
       
-      // 大模型返回的 text 字段
       if (result.text) {
         console.log(`✓ 识别成功: ${result.text}`);
         return result.text;
       }
       
-      // 兼容其他可能的格式
       if (result.utterances && result.utterances.length > 0) {
         const text = result.utterances.map(u => u.text).join('');
         console.log(`✓ 识别成功: ${text}`);
@@ -354,6 +353,17 @@ async function recognizeVoiceWithVolc(audioUrl, audioFormat = 'ogg') {
     console.error('火山引擎识别错误:', error.message);
     throw new Error(`语音识别失败: ${error.message}`);
   }
+}
+
+// 下载 Telegram 音频到内存，返回 base64
+async function downloadAudioAsBase64(fileUrl) {
+  const response = await axios.get(fileUrl, { 
+    responseType: 'arraybuffer',
+    timeout: 30000 
+  });
+  const buffer = Buffer.from(response.data);
+  console.log(`✓ 音频已下载，大小: ${buffer.length} 字节`);
+  return buffer.toString('base64');
 }
 
 // ============ 每日总结 ============
@@ -613,26 +623,27 @@ bot.on('message', async msg => {
       await bot.sendMessage(msg.chat.id, '🎙️ 正在识别...');
       
       try {
-        // 直接获取 Telegram 的 URL，火山引擎可以直接访问
+        // 获取 Telegram 音频 URL
         const fileId = msg.voice.file_id;
         const file = await bot.getFile(fileId);
         const filePath = file.file_path;
         const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
         
-        // 火山引擎直接识别 URL（无需下载、无需 FFmpeg）
-        const recognizedText = await recognizeVoiceWithVolc(fileUrl, 'ogg');
+        // 1. 我们的服务器（Railway）下载音频（不让火山去下载，因为火山在国内访问 Telegram 慢）
+        const audioBase64 = await downloadAudioAsBase64(fileUrl);
+        
+        // 2. 用 base64 调用火山引擎
+        const recognizedText = await recognizeVoiceWithVolc(audioBase64, 'ogg');
         
         const caption = msg.caption || '';
         const tags = extractTags(caption);
         
         await saveThought(recognizedText, tags);
         
-        // 发送保存确认 + 识别内容
         await bot.sendMessage(msg.chat.id, 
           `✓ 已保存${tags.length > 0 ? ' ' + tags.join(' ') : ''}\n\n📝 ${recognizedText}`
         );
         
-        // AI 判断是否需要追问
         const followUp = await generateFollowUpQuestion(recognizedText);
         if (followUp) {
           await bot.sendMessage(msg.chat.id, `—— ${followUp}`);
