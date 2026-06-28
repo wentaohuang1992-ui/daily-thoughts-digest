@@ -13,13 +13,8 @@ const redis = require('redis');
 const axios = require('axios');
 const cron = require('node-cron');
 const dotenv = require('dotenv');
-const fs = require('fs');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegStatic = require('ffmpeg-static');
 
 dotenv.config();
-
-ffmpeg.setFfmpegPath(ffmpegStatic);
 
 const app = express();
 app.use(express.json());
@@ -45,11 +40,16 @@ const PORT = process.env.PORT || 3000;
 
 const REDIS_URL = process.env.REDIS_URL;
 
-const BAIDU_APP_ID = process.env.BAIDU_APP_ID;
-const BAIDU_API_KEY = process.env.BAIDU_API_KEY;
-const BAIDU_SECRET_KEY = process.env.BAIDU_SECRET_KEY;
-const BAIDU_TOKEN_URL = 'https://aip.baidubce.com/oauth/2.0/token';
-const BAIDU_ASR_URL = 'http://vop.baidu.com/server_api';
+// 火山引擎语音识别配置
+// 支持两种鉴权方式：
+// 方式 1（新版控制台）: 只需要 VOLC_API_KEY
+// 方式 2（旧版控制台）: VOLC_APP_KEY + VOLC_ACCESS_KEY
+const VOLC_API_KEY = process.env.VOLC_API_KEY;       // 新版
+const VOLC_APP_KEY = process.env.VOLC_APP_KEY;       // 旧版（也叫 AppID）
+const VOLC_ACCESS_KEY = process.env.VOLC_ACCESS_KEY; // 旧版
+
+const VOLC_ASR_URL = 'https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash';
+const VOLC_RESOURCE_ID = 'volc.bigasr.auc_turbo';
 
 // 数据保留时间：365 天
 const RETENTION_DAYS = 365;
@@ -78,56 +78,7 @@ redisClient.on('connect', () => console.log('✓ Redis connected'));
   }
 })();
 
-// ============ 百度 Token 管理 ============
-let baiduAccessToken = null;
-let baiduTokenExpireTime = 0;
-
-async function getBaiduAccessToken() {
-  try {
-    if (baiduAccessToken && Date.now() < (baiduTokenExpireTime - 60000)) {
-      return baiduAccessToken;
-    }
-
-    const response = await axios.post(BAIDU_TOKEN_URL, null, {
-      params: {
-        grant_type: 'client_credentials',
-        client_id: BAIDU_API_KEY,
-        client_secret: BAIDU_SECRET_KEY,
-      },
-      timeout: 10000,
-    });
-
-    if (response.data && response.data.access_token) {
-      baiduAccessToken = response.data.access_token;
-      baiduTokenExpireTime = Date.now() + (response.data.expires_in * 1000);
-      return baiduAccessToken;
-    } else {
-      throw new Error(`获取 Token 失败: ${JSON.stringify(response.data)}`);
-    }
-  } catch (error) {
-    throw new Error(`百度认证失败: ${error.message}`);
-  }
-}
-
-// ============ 音频转换 ============
-function convertOggToWav(inputPath, outputPath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .audioCodec('pcm_s16le')
-      .audioFrequency(16000)
-      .audioChannels(1)
-      .format('wav')
-      .on('end', () => {
-        console.log('✓ 音频转换完成');
-        resolve(outputPath);
-      })
-      .on('error', (err) => {
-        console.error('❌ 音频转换失败:', err.message);
-        reject(new Error(`音频转换失败: ${err.message}`));
-      })
-      .save(outputPath);
-  });
-}
+// ============ 火山引擎语音识别 ============
 
 // ============ 辅助函数 ============
 
@@ -296,56 +247,113 @@ async function generateFollowUpQuestion(content) {
   }
 }
 
-// ============ 百度语音识别 ============
+// ============ 火山引擎语音识别（极速版）============
 
-async function recognizeVoiceWithBaidu(audioFilePath) {
+async function recognizeVoiceWithVolc(audioUrl, audioFormat = 'ogg') {
   try {
-    if (!BAIDU_APP_ID || !BAIDU_API_KEY || !BAIDU_SECRET_KEY) {
-      throw new Error('百度凭证配置缺失');
+    console.log(`🎙️ 使用火山引擎识别: ${audioUrl}`);
+
+    // 判断使用新版还是旧版鉴权
+    const useNewAuth = !!VOLC_API_KEY;
+    const useOldAuth = !!(VOLC_APP_KEY && VOLC_ACCESS_KEY);
+
+    if (!useNewAuth && !useOldAuth) {
+      throw new Error('火山引擎凭证未配置（需要 VOLC_API_KEY，或 VOLC_APP_KEY + VOLC_ACCESS_KEY）');
     }
 
-    const token = await getBaiduAccessToken();
-    const audioData = fs.readFileSync(audioFilePath);
-    const base64Audio = audioData.toString('base64');
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+
+    // 根据鉴权方式构造 headers
+    let headers;
+    if (useNewAuth) {
+      console.log('使用新版鉴权 (X-Api-Key)');
+      headers = {
+        'X-Api-Key': VOLC_API_KEY,
+        'X-Api-Resource-Id': VOLC_RESOURCE_ID,
+        'X-Api-Request-Id': requestId,
+        'X-Api-Sequence': '-1',
+        'Content-Type': 'application/json',
+      };
+    } else {
+      console.log('使用旧版鉴权 (X-Api-App-Key + X-Api-Access-Key)');
+      headers = {
+        'X-Api-App-Key': VOLC_APP_KEY,
+        'X-Api-Access-Key': VOLC_ACCESS_KEY,
+        'X-Api-Resource-Id': VOLC_RESOURCE_ID,
+        'X-Api-Request-Id': requestId,
+        'X-Api-Sequence': '-1',
+        'Content-Type': 'application/json',
+      };
+    }
 
     const requestBody = {
-      format: 'wav',
-      rate: 16000,
-      dev_pid: 1537,
-      channel: 1,
-      cuid: `telegram_${YOUR_CHAT_ID}`,
-      token: token,
-      len: audioData.length,
-      speech: base64Audio,
+      user: {
+        uid: `telegram_${YOUR_CHAT_ID}`,
+      },
+      audio: {
+        url: audioUrl,
+        format: audioFormat,
+      },
+      request: {
+        model_name: 'bigmodel',
+        enable_itn: true,
+        enable_punc: true,
+        enable_ddc: true,
+      },
     };
 
-    const response = await axios.post(BAIDU_ASR_URL, requestBody, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 30000,
+    console.log('向火山引擎发送请求...');
+
+    const response = await axios.post(VOLC_ASR_URL, requestBody, {
+      headers,
+      timeout: 60000,
     });
 
-    if (response.data.err_no !== 0) {
-      throw new Error(`百度 API 错误 (${response.data.err_no}): ${response.data.err_msg}`);
+    console.log('火山引擎响应 status:', response.status);
+    console.log('火山引擎响应 headers:', JSON.stringify(response.headers));
+    console.log('火山引擎响应 data:', JSON.stringify(response.data).substring(0, 500));
+
+    // 检查响应头中的状态码
+    const apiStatusCode = response.headers['x-api-status-code'];
+    const apiMessage = response.headers['x-api-message'];
+
+    if (apiStatusCode && apiStatusCode !== '20000000') {
+      throw new Error(`火山引擎错误 ${apiStatusCode}: ${apiMessage || '未知错误'}`);
     }
 
-    if (response.data.result && response.data.result.length > 0) {
-      return response.data.result[0];
-    } else {
-      throw new Error('百度未返回识别结果');
+    // 提取识别结果
+    if (response.data && response.data.result) {
+      const result = response.data.result;
+      
+      // 大模型返回的 text 字段
+      if (result.text) {
+        console.log(`✓ 识别成功: ${result.text}`);
+        return result.text;
+      }
+      
+      // 兼容其他可能的格式
+      if (result.utterances && result.utterances.length > 0) {
+        const text = result.utterances.map(u => u.text).join('');
+        console.log(`✓ 识别成功: ${text}`);
+        return text;
+      }
     }
+
+    throw new Error(`火山引擎返回格式异常: ${JSON.stringify(response.data).substring(0, 200)}`);
 
   } catch (error) {
+    if (error.response) {
+      console.error('火山引擎响应错误 status:', error.response.status);
+      console.error('火山引擎响应错误 data:', JSON.stringify(error.response.data));
+      const apiStatusCode = error.response.headers?.['x-api-status-code'];
+      const apiMessage = error.response.headers?.['x-api-message'];
+      if (apiStatusCode) {
+        throw new Error(`火山引擎错误 ${apiStatusCode}: ${apiMessage || error.message}`);
+      }
+    }
+    console.error('火山引擎识别错误:', error.message);
     throw new Error(`语音识别失败: ${error.message}`);
   }
-}
-
-async function downloadFile(fileUrl, filePath) {
-  const response = await axios.get(fileUrl, { 
-    responseType: 'arraybuffer',
-    timeout: 30000 
-  });
-  fs.writeFileSync(filePath, response.data);
-  return filePath;
 }
 
 // ============ 每日总结 ============
@@ -602,33 +610,17 @@ bot.on('message', async msg => {
   try {
     // 语音消息
     if (msg.voice) {
-      // 检查语音时长（百度短语音最长 60 秒）
-      const duration = msg.voice.duration || 0;
-      if (duration > 60) {
-        await bot.sendMessage(msg.chat.id, 
-          `⚠️ 语音太长了（${duration} 秒）\n\n百度短语音识别限制为 60 秒以内。请分段录制后再发送。`
-        );
-        return;
-      }
-      
       await bot.sendMessage(msg.chat.id, '🎙️ 正在识别...');
       
-      const timestamp = Date.now();
-      const tempOggPath = `/tmp/voice_${timestamp}.ogg`;
-      const tempWavPath = `/tmp/voice_${timestamp}.wav`;
-      
       try {
+        // 直接获取 Telegram 的 URL，火山引擎可以直接访问
         const fileId = msg.voice.file_id;
         const file = await bot.getFile(fileId);
         const filePath = file.file_path;
         const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
         
-        await downloadFile(fileUrl, tempOggPath);
-        await convertOggToWav(tempOggPath, tempWavPath);
-        const recognizedText = await recognizeVoiceWithBaidu(tempWavPath);
-        
-        try { fs.unlinkSync(tempOggPath); } catch (e) {}
-        try { fs.unlinkSync(tempWavPath); } catch (e) {}
+        // 火山引擎直接识别 URL（无需下载、无需 FFmpeg）
+        const recognizedText = await recognizeVoiceWithVolc(fileUrl, 'ogg');
         
         const caption = msg.caption || '';
         const tags = extractTags(caption);
@@ -648,8 +640,6 @@ bot.on('message', async msg => {
         
       } catch (error) {
         console.error('语音处理错误:', error);
-        try { fs.unlinkSync(tempOggPath); } catch (e) {}
-        try { fs.unlinkSync(tempWavPath); } catch (e) {}
         await bot.sendMessage(msg.chat.id, `❌ 识别失败：${error.message}`);
       }
       return;
@@ -807,21 +797,33 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-app.get('/test-baidu', async (req, res) => {
+app.get('/test-volc', async (req, res) => {
   try {
-    if (!BAIDU_APP_ID || !BAIDU_API_KEY || !BAIDU_SECRET_KEY) {
-      throw new Error('百度凭证未配置');
+    const useNewAuth = !!VOLC_API_KEY;
+    const useOldAuth = !!(VOLC_APP_KEY && VOLC_ACCESS_KEY);
+
+    if (!useNewAuth && !useOldAuth) {
+      throw new Error('火山引擎凭证未配置（需要 VOLC_API_KEY，或 VOLC_APP_KEY + VOLC_ACCESS_KEY）');
     }
-    const token = await getBaiduAccessToken();
+    
     res.json({ 
       success: true, 
-      message: '✓ 百度连接成功',
+      message: '✓ 火山引擎凭证已配置',
+      auth_mode: useNewAuth ? '新版（X-Api-Key）' : '旧版（X-Api-App-Key + X-Api-Access-Key）',
+      credentials_preview: useNewAuth 
+        ? { api_key: VOLC_API_KEY.substring(0, 6) + '***' }
+        : { 
+            app_key: VOLC_APP_KEY.substring(0, 6) + '***',
+            access_key: VOLC_ACCESS_KEY.substring(0, 6) + '***'
+          },
+      api_url: VOLC_ASR_URL,
+      resource_id: VOLC_RESOURCE_ID,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
     res.json({ 
       success: false, 
-      message: `❌ 百度连接失败: ${error.message}`,
+      message: `❌ ${error.message}`,
       timestamp: new Date().toISOString()
     });
   }
@@ -869,7 +871,7 @@ app.listen(PORT, () => {
   console.log(`📡 端口 ${PORT}`);
   console.log(`🤖 授权的 Chat IDs: ${ALLOWED_CHAT_IDS.join(', ')}`);
   console.log(`💾 Redis: ${REDIS_URL ? '已配置' : '未配置'}`);
-  console.log(`🎙️ 语音: 百度短语音 + FFmpeg`);
+  console.log(`🎙️ 语音: 火山引擎大模型录音文件识别（极速版）`);
   console.log(`📅 数据保留: ${RETENTION_DAYS} 天`);
   console.log(`\n📆 定时任务：`);
   console.log(`   • 每日 23:00 - 今日回顾`);
